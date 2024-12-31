@@ -10,6 +10,7 @@ pub mod provider;
 mod settings;
 
 use crate::provider::anthropic::AnthropicLanguageModelProvider;
+use crate::provider::azure::AzureLanguageModelProvider;
 use crate::provider::cloud::CloudLanguageModelProvider;
 pub use crate::provider::cloud::LlmApiToken;
 pub use crate::provider::cloud::RefreshLlmTokenListener;
@@ -26,10 +27,11 @@ pub fn init(
     fs: Arc<dyn Fs>,
     cx: &mut AppContext,
 ) {
-    crate::settings::init(fs, cx);
+    crate::settings::init(fs.clone(), cx);
     let registry = LanguageModelRegistry::global(cx);
     registry.update(cx, |registry, cx| {
-        register_language_model_providers(registry, user_store, client, cx);
+        register_language_model_providers(registry, user_store, client, fs.clone(), cx);
+        // Pass fs here
     });
 }
 
@@ -37,6 +39,7 @@ fn register_language_model_providers(
     registry: &mut LanguageModelRegistry,
     user_store: Model<UserStore>,
     client: Arc<Client>,
+    fs: Arc<dyn Fs>, // Include fs parameter
     cx: &mut ModelContext<LanguageModelRegistry>,
 ) {
     use feature_flags::FeatureFlagAppExt;
@@ -60,6 +63,10 @@ fn register_language_model_providers(
         cx,
     );
     registry.register_provider(CopilotChatLanguageModelProvider::new(cx), cx);
+    registry.register_provider(
+        AzureLanguageModelProvider::new(client.http_client(), fs.clone(), cx),
+        cx,
+    );
 
     cx.observe_flag::<feature_flags::LanguageModels, _>(move |enabled, cx| {
         let user_store = user_store.clone();

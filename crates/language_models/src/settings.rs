@@ -59,6 +59,7 @@ pub struct AllLanguageModelSettings {
     pub zed_dot_dev: ZedDotDevSettings,
     pub google: GoogleSettings,
     pub copilot_chat: CopilotChatSettings,
+    pub azure: AzureSettings,
 }
 
 #[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, JsonSchema)]
@@ -70,6 +71,19 @@ pub struct AllLanguageModelSettingsContent {
     pub zed_dot_dev: Option<ZedDotDevSettingsContent>,
     pub google: Option<GoogleSettingsContent>,
     pub copilot_chat: Option<CopilotChatSettingsContent>,
+    pub azure: Option<AzureSettingsContent>,
+}
+
+// Define AzureSettings
+#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, JsonSchema)]
+pub struct AzureSettings {
+    pub api_url: Option<String>,
+}
+
+// Define AzureSettingsContent
+#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, JsonSchema)]
+pub struct AzureSettingsContent {
+    pub api_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, JsonSchema)]
@@ -311,6 +325,12 @@ impl settings::Settings for AllLanguageModelSettings {
                     .google
                     .as_ref()
                     .and_then(|s| s.available_models.clone()),
+            );
+
+            // Azure
+            merge(
+                &mut settings.azure.api_url,
+                Some(value.azure.as_ref().and_then(|s| s.api_url.clone())),
             );
         }
 
