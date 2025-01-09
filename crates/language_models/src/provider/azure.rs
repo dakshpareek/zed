@@ -205,22 +205,20 @@ impl AzureOpenAiLanguageModel {
         let http_client = self.http_client.clone();
         let state = self.state.clone();
 
-        let (api_key, api_url) = match cx.read_model(&state, |state, cx| {
-            let api_url = AllLanguageModelSettings::get_global(cx)
-                .azure
-                .api_url
-                .clone()
-                .unwrap_or_default();
-            (state.api_key.clone(), api_url)
+        let (api_key, settings) = match cx.read_model(&state, |state, cx| {
+            let settings = AllLanguageModelSettings::get_global(cx).azure.clone();
+            (state.api_key.clone(), settings)
         }) {
-            Ok((Some(api_key), api_url)) => (api_key, api_url),
-            Ok((None, _)) => {
-                return futures::future::ready(Err(anyhow!("Missing Azure OpenAI API Key"))).boxed()
-            }
-            Err(err) => {
-                return futures::future::ready(Err(anyhow!("App state error: {}", err))).boxed()
-            }
+            Ok((Some(api_key), settings)) => (api_key, settings),
+            Ok((None, _)) => return futures::future::ready(Err(anyhow!("Missing Azure OpenAI API Key"))).boxed(),
+            Err(err) => return futures::future::ready(Err(anyhow!("App state error: {}", err))).boxed(),
         };
+
+        let api_url = settings.api_url.unwrap_or_default();
+
+        // Use the deployment name and API version from settings if available
+        let deployment_name = settings.deployment_name.unwrap_or(deployment_name);
+        let api_version = settings.api_version.unwrap_or_else(|| api_version.to_string());
 
         let future = self.request_limiter.stream(async move {
             let is_azure_endpoint = api_url.contains(".azure.com");
@@ -258,7 +256,7 @@ async fn azure_stream_completion(
         ("Authorization", format!("Bearer {}", api_key))
     };
 
-    let mut request_builder = HttpRequest::builder()
+    let request_builder = HttpRequest::builder()
         .method(Method::POST)
         .uri(api_url)
         .header("Content-Type", "application/json")
@@ -380,10 +378,14 @@ impl State {
         &mut self,
         api_key: String,
         endpoint: String,
+        deployment: String,
+        api_version: String,
         cx: &mut ModelContext<Self>,
     ) -> Task<Result<()>> {
         // Clone the endpoint before moving it into the closure
-        let endpoint_for_closure = endpoint.clone();
+        let endpoint_for_settings = endpoint.clone();
+        let deployment_for_settings = deployment.clone();
+        let api_version_for_settings = api_version.clone();
 
         // Save the endpoint to settings
         let fs = self.fs.clone();
@@ -394,10 +396,16 @@ impl State {
             move |settings, _| {
                 if settings.azure.is_none() {
                     settings.azure = Some(crate::AzureSettingsContent {
-                        api_url: Some(endpoint_for_closure.clone()),
+                        api_url: Some(endpoint_for_settings.clone()),
+                        deployment_name: Some(deployment_for_settings.clone()),
+                        api_version: Some(api_version_for_settings.clone()),
                     });
+                } else {
+                    let azure = settings.azure.as_mut().unwrap();
+                    azure.api_url = Some(endpoint_for_settings.clone());
+                    azure.deployment_name = Some(deployment_for_settings.clone());
+                    azure.api_version = Some(api_version_for_settings.clone());
                 }
-                settings.azure.as_mut().unwrap().api_url = Some(endpoint_for_closure.clone());
             },
         );
 
@@ -418,6 +426,8 @@ impl State {
 struct ConfigurationView {
     api_key_editor: View<Editor>,
     endpoint_editor: View<Editor>,
+    deployment_editor: View<Editor>,
+    api_version_editor: View<Editor>,
     state: Model<State>,
     load_credentials_task: Option<Task<()>>,
 }
@@ -433,6 +443,18 @@ impl ConfigurationView {
         let endpoint_editor = cx.new_view(|cx| {
             let mut editor = Editor::single_line(cx);
             editor.set_placeholder_text("https://<your-azure-openai-endpoint>", cx);
+            editor
+        });
+
+        let deployment_editor = cx.new_view(|cx| {
+            let mut editor = Editor::single_line(cx);
+            editor.set_placeholder_text("Enter your deployment name", cx);
+            editor
+        });
+
+        let api_version_editor = cx.new_view(|cx| {
+            let mut editor = Editor::single_line(cx);
+            editor.set_placeholder_text("API version (e.g., 2024-02-15-preview)", cx);
             editor
         });
 
@@ -462,6 +484,8 @@ impl ConfigurationView {
         Self {
             api_key_editor,
             endpoint_editor,
+            deployment_editor,
+            api_version_editor,
             state,
             load_credentials_task,
         }
@@ -470,7 +494,9 @@ impl ConfigurationView {
     fn save_credentials(&mut self, _: &menu::Confirm, cx: &mut ViewContext<Self>) {
         let api_key = self.api_key_editor.read(cx).text(cx);
         let endpoint = self.endpoint_editor.read(cx).text(cx);
-        if api_key.is_empty() || endpoint.is_empty() {
+        let deployment = self.deployment_editor.read(cx).text(cx);
+        let api_version = self.api_version_editor.read(cx).text(cx);
+        if api_key.is_empty() || endpoint.is_empty() || deployment.is_empty() || api_version.is_empty() {
             return;
         }
 
@@ -478,7 +504,7 @@ impl ConfigurationView {
         cx.spawn(|_, mut cx| async move {
             state
                 .update(&mut cx, |state, cx| {
-                    state.set_api_key_and_endpoint(api_key, endpoint, cx)
+                    state.set_api_key_and_endpoint(api_key, endpoint,deployment, api_version, cx)
                 })?
                 .await
         })
@@ -560,6 +586,62 @@ impl ConfigurationView {
         )
     }
 
+    fn render_deployment_editor(&self, cx: &mut ViewContext<Self>) -> impl IntoElement {
+        let settings = ThemeSettings::get_global(cx);
+        let text_style = TextStyle {
+            color: cx.theme().colors().text,
+            font_family: settings.ui_font.family.clone(),
+            font_features: settings.ui_font.features.clone(),
+            font_fallbacks: settings.ui_font.fallbacks.clone(),
+            font_size: rems(0.875).into(),
+            font_weight: settings.ui_font.weight,
+            font_style: FontStyle::Normal,
+            line_height: relative(1.3),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+            white_space: WhiteSpace::Normal,
+            truncate: None,
+        };
+        EditorElement::new(
+            &self.deployment_editor,
+            EditorStyle {
+                background: cx.theme().colors().editor_background,
+                local_player: cx.theme().players().local(),
+                text: text_style.clone(),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn render_api_version_editor(&self, cx: &mut ViewContext<Self>) -> impl IntoElement {
+        let settings = ThemeSettings::get_global(cx);
+        let text_style = TextStyle {
+            color: cx.theme().colors().text,
+            font_family: settings.ui_font.family.clone(),
+            font_features: settings.ui_font.features.clone(),
+            font_fallbacks: settings.ui_font.fallbacks.clone(),
+            font_size: rems(0.875).into(),
+            font_weight: settings.ui_font.weight,
+            font_style: FontStyle::Normal,
+            line_height: relative(1.3),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+            white_space: WhiteSpace::Normal,
+            truncate: None,
+        };
+        EditorElement::new(
+            &self.api_version_editor,
+            EditorStyle {
+                background: cx.theme().colors().editor_background,
+                local_player: cx.theme().players().local(),
+                text: text_style,
+                ..Default::default()
+            },
+        )
+    }
+
     fn should_render_editor(&self, cx: &mut ViewContext<Self>) -> bool {
         !self.state.read(cx).is_authenticated()
     }
@@ -603,6 +685,28 @@ impl Render for ConfigurationView {
                         .rounded_md()
                         .child(Label::new("Endpoint URL:"))
                         .child(self.render_endpoint_editor(cx)),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .my_2()
+                        .px_2()
+                        .py_1()
+                        .bg(cx.theme().colors().editor_background)
+                        .rounded_md()
+                        .child(Label::new("Deployment Name:"))
+                        .child(self.render_deployment_editor(cx)),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .my_2()
+                        .px_2()
+                        .py_1()
+                        .bg(cx.theme().colors().editor_background)
+                        .rounded_md()
+                        .child(Label::new("API Version:"))
+                        .child(self.render_api_version_editor(cx)),
                 )
                 .child(
                     Label::new(

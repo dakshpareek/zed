@@ -78,12 +78,16 @@ pub struct AllLanguageModelSettingsContent {
 #[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct AzureSettings {
     pub api_url: Option<String>,
+    pub deployment_name: Option<String>,
+    pub api_version: Option<String>,
 }
 
 // Define AzureSettingsContent
 #[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct AzureSettingsContent {
     pub api_url: Option<String>,
+    pub deployment_name: Option<String>,
+    pub api_version: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, JsonSchema)]
