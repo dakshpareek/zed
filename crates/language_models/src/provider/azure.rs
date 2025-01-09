@@ -13,7 +13,7 @@ use language_model::{
     LanguageModelProvider, LanguageModelProviderId, LanguageModelProviderName,
     LanguageModelProviderState, LanguageModelRequest, RateLimiter,
 };
-use open_ai::{self, Request as OpenAiRequest, ResponseStreamEvent, ResponseStreamResult};
+use open_ai::{self, Request as OpenAiRequest, ResponseStreamEvent, ResponseStreamResult, Response};
 use settings::{Settings, SettingsStore};
 use std::sync::Arc;
 use strum::IntoEnumIterator;
@@ -210,15 +210,30 @@ impl AzureOpenAiLanguageModel {
             (state.api_key.clone(), settings)
         }) {
             Ok((Some(api_key), settings)) => (api_key, settings),
-            Ok((None, _)) => return futures::future::ready(Err(anyhow!("Missing Azure OpenAI API Key"))).boxed(),
-            Err(err) => return futures::future::ready(Err(anyhow!("App state error: {}", err))).boxed(),
+            Ok((None, _)) => {
+                log::error!("Azure OpenAI API Key is missing!");
+                return futures::future::ready(Err(anyhow!("Missing Azure OpenAI API Key"))).boxed();
+            }
+            Err(err) => {
+                log::error!("Error reading app state: {}", err);
+                return futures::future::ready(Err(anyhow!("App state error: {}", err))).boxed();
+            }
         };
 
         let api_url = settings.api_url.unwrap_or_default();
 
-        // Use the deployment name and API version from settings if available
         let deployment_name = settings.deployment_name.unwrap_or(deployment_name);
         let api_version = settings.api_version.unwrap_or_else(|| api_version.to_string());
+
+        log::info!(
+            "Azure OpenAI request: model = {}, deployment_name = {}, api_url = {}, api_version = {}",
+            request.model,
+            deployment_name,
+            api_url,
+            api_version
+        );
+
+        let is_o1_model = request.model == "o1-preview" || request.model == "o1-mini";
 
         let future = self.request_limiter.stream(async move {
             let is_azure_endpoint = api_url.contains(".azure.com");
@@ -230,16 +245,120 @@ impl AzureOpenAiLanguageModel {
                     api_version
                 )
             } else {
-                // If not an Azure endpoint, use the standard OpenAI API URL
                 format!("{}/v1/chat/completions", api_url.trim_end_matches('/'))
             };
 
-            let response_stream =
-                azure_stream_completion(http_client.as_ref(), &api_url, &api_key, request).await?;
-            Ok(response_stream)
+            if is_o1_model {
+                log::info!("Using non-streaming completion flow for model {}", request.model);
+
+                let mut request_body = request; // Clone the request object
+                request_body.stream = false;    // Explicitly disable stream for o1-preview
+
+                // Log the request details for debugging
+                let serialized_payload = serde_json::to_string(&request_body).unwrap_or_else(|e| format!("Error serializing payload: {}", e));
+                log::info!("Requesting Azure OpenAI API with payload: {}", serialized_payload);
+                log::info!("API URL: {}", api_url);
+                log::debug!("Deployment Name: {}", deployment_name);
+
+                let response = azure_complete(http_client.as_ref(), &api_url, &api_key, request_body).await;
+                log::info!("Response received: {:?}", response);
+
+                let response_stream_event = match response {
+                    Ok(result) => Ok(adapt_response_to_stream(result)),
+                    Err(err) => Err(err),
+                };
+
+                return Ok(futures::stream::once(futures::future::ready(response_stream_event)).boxed());
+            } else {
+                // Handle streaming models (e.g., gpt-3.5-turbo, gpt-4)
+                let response_stream =
+                    azure_stream_completion(http_client.as_ref(), &api_url, &api_key, request)
+                        .await?;
+                Ok(response_stream.boxed())
+            }
         });
 
         async move { Ok(future.await?.boxed()) }.boxed()
+    }
+}
+
+fn adapt_response_to_stream(response: open_ai::Response) -> open_ai::ResponseStreamEvent {
+    open_ai::ResponseStreamEvent {
+        created: response.created as u32,
+        model: response.model,
+        choices: response
+            .choices
+            .into_iter()
+            .map(|choice| open_ai::ChoiceDelta {
+                index: choice.index,
+                delta: open_ai::ResponseMessageDelta {
+                    role: Some(match choice.message {
+                        open_ai::RequestMessage::Assistant { .. } => open_ai::Role::Assistant,
+                        open_ai::RequestMessage::User { .. } => open_ai::Role::User,
+                        open_ai::RequestMessage::System { .. } => open_ai::Role::System,
+                        open_ai::RequestMessage::Tool { .. } => open_ai::Role::Tool,
+                    }),
+                    content: match choice.message {
+                        open_ai::RequestMessage::Assistant { content, .. } => content,
+                        open_ai::RequestMessage::User { content } => Some(content),
+                        open_ai::RequestMessage::System { content } => Some(content),
+                        open_ai::RequestMessage::Tool { content, .. } => Some(content),
+                    },
+                    tool_calls: None,
+                },
+                finish_reason: choice.finish_reason,
+            })
+            .collect(),
+        usage: Some(response.usage),
+    }
+}
+
+async fn azure_complete(
+    client: &dyn HttpClient,
+    api_url: &str,
+    api_key: &str,
+    request: OpenAiRequest,
+) -> Result<Response> {
+    // Azure-specific headers
+    let request_builder = HttpRequest::builder()
+        .method(Method::POST)
+        .uri(api_url) // Use the exact api_url without OpenAI-specific modifications
+        .header("Content-Type", "application/json")
+        .header("api-key", api_key.to_string()); // Azure-specific API key header
+
+    // Serialize the request body
+    let request_body = serde_json::to_string(&request)?;
+    log::info!("Azure Request Body: {}", request_body);
+
+    let request = request_builder.body(AsyncBody::from(request_body))?;
+
+    // Send the request
+    log::info!("Sending request to Azure URI: {}", api_url);
+
+    let mut response = client.send(request).await?;
+
+    // Log and handle response
+    if response.status().is_success() {
+        let mut body = String::new();
+        response.body_mut().read_to_string(&mut body).await?;
+        log::info!("Azure Successful Response Body: {}", body);
+
+        let response: Response = serde_json::from_str(&body)?;
+        Ok(response)
+    } else {
+        let mut body = String::new();
+        response.body_mut().read_to_string(&mut body).await?;
+        log::error!(
+            "Azure Error Response - Status: {}, Body: {}",
+            response.status(),
+            body
+        );
+
+        Err(anyhow!(
+            "Azure OpenAI API Error - Status: {}, Body: {}",
+            response.status(),
+            body
+        ))
     }
 }
 
@@ -251,8 +370,10 @@ async fn azure_stream_completion(
 ) -> Result<impl Stream<Item = Result<ResponseStreamEvent>> + Send + 'static> {
     let is_azure_endpoint = api_url.contains(".azure.com");
     let (auth_header_name, auth_value) = if is_azure_endpoint {
+        log::info!("Using Azure-specific API key authentication.");
         ("api-key", api_key.to_string())
     } else {
+        log::info!("Using standard 'Authorization: Bearer' authentication.");
         ("Authorization", format!("Bearer {}", api_key))
     };
 
@@ -262,14 +383,16 @@ async fn azure_stream_completion(
         .header("Content-Type", "application/json")
         .header(auth_header_name, auth_value);
 
-    // Log headers before consuming the request_builder
-    let headers = request_builder.headers_ref().cloned(); // Clone the headers for logging
-
     let request_body = serde_json::to_string(&request)?;
+    log::debug!("Request body: {}", request_body);
+
     let request = request_builder.body(AsyncBody::from(request_body.clone()))?;
+
+    log::info!("Sending request to Azure OpenAI API: {}", api_url);
 
     let mut response = client.send(request).await?;
     if response.status().is_success() {
+        log::info!("Azure OpenAI API request succeeded with status: {}", response.status());
         let reader = BufReader::new(response.into_body());
         Ok(reader
             .lines()
@@ -307,7 +430,7 @@ async fn azure_stream_completion(
             Status: {}\n\
             Response Body: {}",
             api_url,
-            headers.unwrap_or_default(), // Use the cloned headers here
+            response.headers(),
             request_body,
             response.status(),
             response_body
@@ -323,7 +446,13 @@ async fn azure_stream_completion(
 // Implement State methods
 impl State {
     fn is_authenticated(&self) -> bool {
-        self.api_key.is_some()
+        let authenticated = self.api_key.is_some();
+        if !authenticated {
+            log::warn!("Azure provider authentication still missing.");
+        } else {
+            log::debug!("Azure provider authenticated successfully."); // Use debug to avoid spamming logs
+        }
+        authenticated
     }
 
     fn authenticate(&self, cx: &mut ModelContext<Self>) -> Task<Result<()>> {
