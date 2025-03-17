@@ -203,7 +203,7 @@ impl AzureOpenAiLanguageModel {
     > {
         let http_client = self.http_client.clone();
 
-        // Get credentials and clone them immediately to ensure they live long enough
+        // Retrieve credentials from state.
         let Ok(credentials) = cx.read_entity(&self.state, |state, _cx| {
             let (api_key, api_url, deployment_name, api_version) = state.get_credentials();
             (
@@ -224,21 +224,133 @@ impl AzureOpenAiLanguageModel {
             let deployment_name = deployment_name.ok_or_else(|| anyhow!("Missing Deployment Name"))?;
             let api_version = api_version.ok_or_else(|| anyhow!("Missing API Version"))?;
 
-            let request = into_azure_open_ai_request(request);
-            let completions = stream_azure_open_ai_completion(
-                http_client.as_ref(),
-                &api_url,
-                &api_key,
-                &deployment_name,
-                &api_version,
-                request,
-            ).await?;
+            // Convert the request and build the JSON payload.
+            let open_ai_request = into_azure_open_ai_request(request);
+            let request_payload = build_request_payload(&open_ai_request, &deployment_name)?;
 
-            Ok(extract_text_from_azure_events(completions)
-                .map(|result| result.map(LanguageModelCompletionEvent::Text))
-                .boxed())
+            // Determine if non-streaming mode should be used.
+            let is_non_streaming = deployment_name == "o1" || deployment_name == "o1-preview" || deployment_name == "o1-mini";
+
+            if is_non_streaming {
+                // For non-streaming models.
+                let response = complete_azure_open_ai(
+                    http_client.as_ref(),
+                    &api_url,
+                    &api_key,
+                    &deployment_name,
+                    &api_version,
+                    request_payload,
+                ).await?;
+
+                let event = adapt_response_to_stream(response);
+                let stream = futures::stream::once(futures::future::ready(Ok(event)));
+                let text_stream = extract_text_from_azure_events(stream)
+                    .map(|result| result.map(LanguageModelCompletionEvent::Text));
+                Ok(text_stream.boxed())
+            } else {
+                // For streaming models.
+                let completions = stream_azure_open_ai_completion(
+                    http_client.as_ref(),
+                    &api_url,
+                    &api_key,
+                    &deployment_name,
+                    &api_version,
+                    request_payload,
+                ).await?;
+                Ok(extract_text_from_azure_events(completions)
+                    .map(|result| result.map(LanguageModelCompletionEvent::Text))
+                    .boxed())
+            }
         }
         .boxed()
+    }
+}
+
+
+fn build_request_payload(
+    request: &open_ai::Request,
+    deployment_name: &str,
+) -> Result<serde_json::Value> {
+    // Convert the request into a JSON value.
+    let mut payload = serde_json::to_value(request)?;
+    // If deployment is "o3-mini", add reasoning_effort.
+    if deployment_name == "o3-mini" {
+        if let serde_json::Value::Object(ref mut map) = payload {
+            map.insert(
+                "reasoning_effort".to_string(),
+                serde_json::Value::String("high".to_string()),
+            );
+        }
+    }
+    Ok(payload)
+}
+
+
+async fn complete_azure_open_ai(
+    client: &dyn HttpClient,
+    api_url: &str,
+    api_key: &str,
+    deployment_name: &str,
+    api_version: &str,
+    request_payload: serde_json::Value,
+) -> Result<open_ai::Response> {
+    let uri = format!(
+        "{}/openai/deployments/{}/chat/completions?api-version={}",
+        api_url.trim_end_matches('/'),
+        deployment_name,
+        api_version
+    );
+    let request_builder = http_client::Request::builder()
+        .method(http_client::Method::POST)
+        .uri(uri)
+        .header("Content-Type", "application/json")
+        .header("api-key", api_key);
+    let request_body = serde_json::to_string(&request_payload)?;
+    let request = request_builder.body(http_client::AsyncBody::from(request_body))?;
+    let mut response = client.send(request).await?;
+    if response.status().is_success() {
+        let mut body = String::new();
+        response.body_mut().read_to_string(&mut body).await?;
+        let response: open_ai::Response = serde_json::from_str(&body)?;
+        Ok(response)
+    } else {
+        let mut body = String::new();
+        response.body_mut().read_to_string(&mut body).await?;
+        Err(anyhow!(
+            "Failed to connect to Azure OpenAI API: {} {}",
+            response.status(),
+            body
+        ))
+    }
+}
+
+/// Adapts a non-streaming response into a ResponseStreamEvent.
+pub fn adapt_response_to_stream(response: open_ai::Response) -> open_ai::ResponseStreamEvent {
+    open_ai::ResponseStreamEvent {
+        created: response.created as u32,
+        model: response.model,
+        choices: response.choices.into_iter().map(|choice| {
+            open_ai::ChoiceDelta {
+                index: choice.index,
+                delta: open_ai::ResponseMessageDelta {
+                    role: Some(match choice.message {
+                        open_ai::RequestMessage::Assistant { .. } => open_ai::Role::Assistant,
+                        open_ai::RequestMessage::User { .. } => open_ai::Role::User,
+                        open_ai::RequestMessage::System { .. } => open_ai::Role::System,
+                        open_ai::RequestMessage::Tool { .. } => open_ai::Role::Tool,
+                    }),
+                    content: match choice.message {
+                        open_ai::RequestMessage::Assistant { content, .. } => content,
+                        open_ai::RequestMessage::User { content } => Some(content),
+                        open_ai::RequestMessage::System { content } => Some(content),
+                        open_ai::RequestMessage::Tool { content, .. } => Some(content),
+                    },
+                    tool_calls: None,
+                },
+                finish_reason: choice.finish_reason,
+            }
+        }).collect(),
+        usage: Some(response.usage),
     }
 }
 
@@ -314,34 +426,47 @@ impl State {
 fn into_azure_open_ai_request(
     request: language_model::LanguageModelRequest,
 ) -> open_ai::Request {
-    // Map LanguageModelRequest into OpenAI Request
-    // Since Azure API is similar to OpenAI API but with different endpoint and auth
+    // Define the default system message.
+    let default_system_message = open_ai::RequestMessage::System {
+        content: "Formatting re-enabled - please enclose code blocks with appropriate Markdown tags.".to_string(),
+    };
+
+    // Start with an empty messages vector.
+    let mut messages: Vec<open_ai::RequestMessage> = Vec::new();
+
+    // Check if there's already a system message provided.
+    let has_system_message = request.messages.iter().any(|msg| matches!(msg.role, Role::System));
+    if !has_system_message {
+        // Prepend the default system message if none exists.
+        messages.push(default_system_message);
+    }
+
+    // Convert and add all the incoming messages.
+    messages.extend(request.messages.into_iter().map(|msg| match msg.role {
+        Role::User => open_ai::RequestMessage::User {
+            content: msg.string_contents(),
+        },
+        Role::Assistant => open_ai::RequestMessage::Assistant {
+            content: Some(msg.string_contents()),
+            tool_calls: Vec::new(),
+        },
+        Role::System => open_ai::RequestMessage::System {
+            content: msg.string_contents(),
+        },
+    }));
+
     open_ai::Request {
-        model: "".to_string(), // The model is selected via deployment_name in Azure
-        messages: request
-            .messages
-            .into_iter()
-            .map(|msg| match msg.role {
-                Role::User => open_ai::RequestMessage::User {
-                    content: msg.string_contents(),
-                },
-                Role::Assistant => open_ai::RequestMessage::Assistant {
-                    content: Some(msg.string_contents()),
-                    tool_calls: Vec::new(),
-                },
-                Role::System => open_ai::RequestMessage::System {
-                    content: msg.string_contents(),
-                },
-            })
-            .collect(),
+        model: "".to_string(), // The model is selected via deployment_name in Azure.
+        messages,
         stream: true,
         stop: request.stop,
         temperature: request.temperature.unwrap_or(1.0),
-        max_tokens: None, // You can set this based on model capabilities
+        max_tokens: None, // You can adjust this based on model capabilities.
         tools: Vec::new(),
         tool_choice: None,
     }
 }
+
 
 async fn stream_azure_open_ai_completion(
     client: &dyn HttpClient,
@@ -349,7 +474,7 @@ async fn stream_azure_open_ai_completion(
     api_key: &str,
     deployment_name: &str,
     api_version: &str,
-    request: open_ai::Request,
+    request_payload: serde_json::Value,
 ) -> Result<futures::stream::BoxStream<'static, Result<open_ai::ResponseStreamEvent>>> {
     let uri = format!(
         "{}/openai/deployments/{}/chat/completions?api-version={}",
@@ -361,9 +486,9 @@ async fn stream_azure_open_ai_completion(
         .method(http_client::Method::POST)
         .uri(uri)
         .header("Content-Type", "application/json")
-        .header("api-key", api_key); // Azure uses 'api-key' header
-
-    let request = request_builder.body(http_client::AsyncBody::from(serde_json::to_string(&request)?))?;
+        .header("api-key", api_key);
+    let request_body = serde_json::to_string(&request_payload)?;
+    let request = request_builder.body(http_client::AsyncBody::from(request_body))?;
     let mut response = client.send(request).await?;
     if response.status().is_success() {
         let reader = futures::io::BufReader::new(response.into_body());
@@ -376,8 +501,9 @@ async fn stream_azure_open_ai_completion(
                         if line == "[DONE]" {
                             None
                         } else {
-                            match serde_json::from_str(line) {
-                                Ok(response) => Some(Ok(response)),
+                            match serde_json::from_str::<open_ai::ResponseStreamResult>(line) {
+                                Ok(open_ai::ResponseStreamResult::Ok(response)) => Some(Ok(response)),
+                                Ok(open_ai::ResponseStreamResult::Err { error }) => Some(Err(anyhow!(error))),
                                 Err(error) => Some(Err(anyhow!(error))),
                             }
                         }
@@ -390,9 +516,8 @@ async fn stream_azure_open_ai_completion(
         let mut body = String::new();
         response.body_mut().read_to_string(&mut body).await?;
         Err(anyhow!(
-            "Failed to connect to Azure OpenAI API: {} {}",
-            response.status(),
-            body
+            "Error from Azure OpenAI API: {}",
+            response.status()
         ))
     }
 }
