@@ -11,6 +11,7 @@ mod settings;
 pub mod ui;
 
 use crate::provider::anthropic::AnthropicLanguageModelProvider;
+use crate::provider::azure_openai::AzureOpenAiLanguageModelProvider;
 use crate::provider::bedrock::BedrockLanguageModelProvider;
 use crate::provider::cloud::CloudLanguageModelProvider;
 use crate::provider::copilot_chat::CopilotChatLanguageModelProvider;
@@ -46,6 +47,10 @@ fn register_language_model_providers(
     );
     registry.register_provider(
         OpenAiLanguageModelProvider::new(client.http_client(), cx),
+        cx,
+    );
+    registry.register_provider(
+        AzureOpenAiLanguageModelProvider::new(client.http_client(), cx),
         cx,
     );
     registry.register_provider(

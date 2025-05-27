@@ -11,6 +11,7 @@ use settings::{Settings, SettingsSources, update_settings_file};
 use crate::provider::{
     self,
     anthropic::AnthropicSettings,
+    azure_openai::AzureOpenAiSettings,
     bedrock::AmazonBedrockSettings,
     cloud::{self, ZedDotDevSettings},
     copilot_chat::CopilotChatSettings,
@@ -58,6 +59,7 @@ pub fn init(fs: Arc<dyn Fs>, cx: &mut App) {
 #[derive(Default)]
 pub struct AllLanguageModelSettings {
     pub anthropic: AnthropicSettings,
+    pub azure_openai: AzureOpenAiSettings,
     pub bedrock: AmazonBedrockSettings,
     pub ollama: OllamaSettings,
     pub openai: OpenAiSettings,
@@ -72,6 +74,7 @@ pub struct AllLanguageModelSettings {
 #[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct AllLanguageModelSettingsContent {
     pub anthropic: Option<AnthropicSettingsContent>,
+    pub azure_openai: Option<AzureOpenAiSettingsContent>,
     pub bedrock: Option<AmazonBedrockSettingsContent>,
     pub ollama: Option<OllamaSettingsContent>,
     pub lmstudio: Option<LmStudioSettingsContent>,
@@ -194,6 +197,13 @@ pub struct MistralSettingsContent {
     pub available_models: Option<Vec<provider::mistral::AvailableModel>>,
 }
 
+#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, JsonSchema)]
+pub struct AzureOpenAiSettingsContent {
+    pub resource_name: Option<String>,
+    pub api_version: Option<String>,
+    pub available_models: Option<Vec<provider::azure_openai::AvailableModel>>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[serde(untagged)]
 pub enum OpenAiSettingsContent {
@@ -286,6 +296,9 @@ impl settings::Settings for AllLanguageModelSettings {
         }
 
         let mut settings = AllLanguageModelSettings::default();
+        
+        // Set default values for Azure OpenAI
+        settings.azure_openai.api_version = "2023-03-15-preview".to_string();
 
         for value in sources.defaults_and_customizations() {
             // Anthropic
@@ -408,6 +421,21 @@ impl settings::Settings for AllLanguageModelSettings {
             merge(
                 &mut settings.mistral.available_models,
                 mistral.as_ref().and_then(|s| s.available_models.clone()),
+            );
+
+            // Azure OpenAI
+            let azure_openai = value.azure_openai.clone();
+            merge(
+                &mut settings.azure_openai.resource_name,
+                azure_openai.as_ref().and_then(|s| s.resource_name.clone()),
+            );
+            merge(
+                &mut settings.azure_openai.api_version,
+                azure_openai.as_ref().and_then(|s| s.api_version.clone()),
+            );
+            merge(
+                &mut settings.azure_openai.available_models,
+                azure_openai.as_ref().and_then(|s| s.available_models.clone()),
             );
         }
 
