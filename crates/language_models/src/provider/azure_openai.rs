@@ -87,15 +87,15 @@ struct AzureOpenAiRequest {
 }
 
 fn convert_to_azure_request(request: open_ai::Request) -> AzureOpenAiRequest {
-    // For o1 models, use max_completion_tokens instead of max_tokens
-    let is_o1_model = request.model.starts_with("o1");
+    // For o1 and o3 models, use max_completion_tokens instead of max_tokens
+    let is_reasoning_model = request.model.starts_with("o1") || request.model.starts_with("o3");
     
     AzureOpenAiRequest {
         model: request.model,
         messages: request.messages,
         stream: request.stream,
-        max_tokens: if is_o1_model { None } else { request.max_tokens },
-        max_completion_tokens: if is_o1_model { request.max_tokens } else { None },
+        max_tokens: if is_reasoning_model { None } else { request.max_tokens },
+        max_completion_tokens: if is_reasoning_model { request.max_tokens } else { None },
         stop: request.stop,
         temperature: request.temperature,
         tool_choice: request.tool_choice,
@@ -127,9 +127,7 @@ fn convert_azure_message_to_openai(azure_message: AzureOpenAiRequestMessage) -> 
     match azure_message {
         AzureOpenAiRequestMessage::Assistant { content, tool_calls } => {
             open_ai::RequestMessage::Assistant {
-                content: content
-                    .map(open_ai::MessageContent::Plain)
-                    .unwrap_or_else(|| open_ai::MessageContent::empty()),
+                content: content.map(open_ai::MessageContent::Plain),
                 tool_calls,
             }
         }
@@ -184,7 +182,7 @@ impl State {
     fn reset_api_key(&self, cx: &mut Context<Self>) -> Task<Result<()>> {
         let credentials_provider = <dyn CredentialsProvider>::global(cx);
         let settings = &AllLanguageModelSettings::get_global(cx).azure_openai;
-        let api_url = format!("https://{}.azure.com", settings.resource_name);
+        let api_url = format!("https://{}.openai.azure.com", settings.resource_name);
         
         cx.spawn(async move |this, cx| {
             credentials_provider
@@ -202,7 +200,7 @@ impl State {
     fn set_api_key(&mut self, api_key: String, cx: &mut Context<Self>) -> Task<Result<()>> {
         let credentials_provider = <dyn CredentialsProvider>::global(cx);
         let settings = &AllLanguageModelSettings::get_global(cx).azure_openai;
-        let api_url = format!("https://{}.azure.com", settings.resource_name);
+        let api_url = format!("https://{}.openai.azure.com", settings.resource_name);
         
         cx.spawn(async move |this, cx| {
             credentials_provider
@@ -223,7 +221,7 @@ impl State {
 
         let credentials_provider = <dyn CredentialsProvider>::global(cx);
         let settings = &AllLanguageModelSettings::get_global(cx).azure_openai;
-        let api_url = format!("https://{}.azure.com", settings.resource_name);
+        let api_url = format!("https://{}.openai.azure.com", settings.resource_name);
 
         cx.spawn(async move |this, cx| {
             let (api_key, from_env) = if let Ok(api_key) = std::env::var(AZURE_OPENAI_API_KEY_VAR) {
@@ -383,11 +381,13 @@ impl AzureOpenAiLanguageModel {
             
             // Build Azure OpenAI endpoint URL
             let api_url = format!(
-                "https://{}.azure.com/openai/deployments/{}/chat/completions?api-version={}",
+                "https://{}.openai.azure.com/openai/deployments/{}/chat/completions?api-version={}",
                 settings.resource_name,
                 deployment_name,
                 settings.api_version
             );
+
+            log::info!("Azure OpenAI request URL: {}", api_url);
 
             // Use Azure OpenAI specific stream completion
             azure_stream_completion(http_client.as_ref(), &api_url, &api_key, request).await
@@ -482,8 +482,8 @@ async fn azure_stream_completion(
     use futures::{AsyncBufReadExt, AsyncReadExt, io::BufReader, stream, future};
     use http_client::{AsyncBody, Method, Request as HttpRequest};
 
-    // For o1 models, use non-streaming completion like OpenAI does
-    if request.model.starts_with("o1") {
+    // For o1 and o3 models, use non-streaming completion
+    if request.model.starts_with("o1") || request.model.starts_with("o3") {
         let response = azure_complete(client, api_url, api_key, request).await;
         let response_stream_event = response.map(adapt_response_to_stream);
         return Ok(stream::once(future::ready(response_stream_event)).boxed());
@@ -544,7 +544,7 @@ async fn azure_complete(
 
     // Convert OpenAI request to Azure-compatible request (without streaming)
     let mut azure_request = convert_to_azure_request(request);
-    azure_request.stream = false; // Ensure no streaming for o1 models
+    azure_request.stream = false; // Ensure no streaming for o1/o3 models
 
     let request_builder = HttpRequest::builder()
         .method(Method::POST)
@@ -561,6 +561,11 @@ async fn azure_complete(
     if response.status().is_success() {
         let azure_response: AzureOpenAiResponse = serde_json::from_str(&body)
             .context("failed to parse Azure OpenAI response")?;
+        
+        if azure_response.choices.is_empty() {
+            anyhow::bail!("Azure OpenAI response contained no choices. Response body: {}", body);
+        }
+        
         Ok(convert_azure_response_to_openai(azure_response))
     } else {
         anyhow::bail!("Failed to connect to Azure OpenAI API: {} {}", response.status(), body)
@@ -575,23 +580,65 @@ fn adapt_response_to_stream(response: open_ai::Response) -> ResponseStreamEvent 
             .choices
             .into_iter()
             .map(|choice| {
-                let (content, tool_calls) = match &choice.message {
-                    open_ai::RequestMessage::Assistant { content, tool_calls } => (content, Some(tool_calls)),
-                    open_ai::RequestMessage::User { content } => (content, None),
-                    open_ai::RequestMessage::System { content } => (content, None),
-                    open_ai::RequestMessage::Tool { content, .. } => (content, None),
-                };
-
                 let mut text_content = String::new();
-                match content {
-                    open_ai::MessageContent::Plain(text) => text_content.push_str(&text),
-                    open_ai::MessageContent::Multipart(parts) => {
-                        for part in parts {
-                            match part {
-                                open_ai::MessagePart::Text { text } => text_content.push_str(&text),
-                                open_ai::MessagePart::Image { .. } => {}
-                            }
+                let tool_calls = match &choice.message {
+                    open_ai::RequestMessage::Assistant { content, tool_calls } => {
+                        if let Some(content) = content {
+                            match content {
+                                open_ai::MessageContent::Plain(text) => text_content.push_str(&text),
+                                open_ai::MessageContent::Multipart(parts) => {
+                                    for part in parts {
+                                        match part {
+                                            open_ai::MessagePart::Text { text } => text_content.push_str(&text),
+                                            open_ai::MessagePart::Image { .. } => {}
+                                        }
+                                    }
+                                }
+                            };
                         }
+                        Some(tool_calls)
+                    }
+                    open_ai::RequestMessage::User { content } => {
+                        match content {
+                            open_ai::MessageContent::Plain(text) => text_content.push_str(&text),
+                            open_ai::MessageContent::Multipart(parts) => {
+                                for part in parts {
+                                    match part {
+                                        open_ai::MessagePart::Text { text } => text_content.push_str(&text),
+                                        open_ai::MessagePart::Image { .. } => {}
+                                    }
+                                }
+                            }
+                        };
+                        None
+                    }
+                    open_ai::RequestMessage::System { content } => {
+                        match content {
+                            open_ai::MessageContent::Plain(text) => text_content.push_str(&text),
+                            open_ai::MessageContent::Multipart(parts) => {
+                                for part in parts {
+                                    match part {
+                                        open_ai::MessagePart::Text { text } => text_content.push_str(&text),
+                                        open_ai::MessagePart::Image { .. } => {}
+                                    }
+                                }
+                            }
+                        };
+                        None
+                    }
+                    open_ai::RequestMessage::Tool { content, .. } => {
+                        match content {
+                            open_ai::MessageContent::Plain(text) => text_content.push_str(&text),
+                            open_ai::MessageContent::Multipart(parts) => {
+                                for part in parts {
+                                    match part {
+                                        open_ai::MessagePart::Text { text } => text_content.push_str(&text),
+                                        open_ai::MessagePart::Image { .. } => {}
+                                    }
+                                }
+                            }
+                        };
+                        None
                     }
                 };
 
