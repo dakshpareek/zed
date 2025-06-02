@@ -387,8 +387,6 @@ impl AzureOpenAiLanguageModel {
                 settings.api_version
             );
 
-            log::info!("Azure OpenAI request URL: {}", api_url);
-
             // Use Azure OpenAI specific stream completion
             azure_stream_completion(http_client.as_ref(), &api_url, &api_key, request).await
         }
@@ -493,7 +491,6 @@ async fn azure_stream_completion(
     let azure_request = convert_to_azure_request(request);
 
     let request_body = serde_json::to_string(&azure_request)?;
-    log::info!("Azure OpenAI request body: {}", request_body);
 
     let request_builder = HttpRequest::builder()
         .method(Method::POST)
@@ -511,29 +508,25 @@ async fn azure_stream_completion(
             .filter_map(|line| async move {
                 match line {
                     Ok(line) => {
-                        log::info!("Azure OpenAI stream raw line: {}", line); // Log the raw line
                         let line = line.strip_prefix("data: ")?;
                         if line == "[DONE]" {
                             None
                         } else {
                             match serde_json::from_str(line) {
                                 Ok(open_ai::ResponseStreamResult::Ok(response)) => {
-                                    log::info!("Azure OpenAI stream parsed response: {:?}", response); // Log successful parsing
                                     Some(Ok(response))
                                 }
                                 Ok(open_ai::ResponseStreamResult::Err { error }) => {
-                                    log::error!("Azure OpenAI stream API error: {}", error); // Log API-returned error
+                                    log::error!("Azure OpenAI stream API error: {}", error);
                                     Some(Err(anyhow!(error)))
                                 }
                                 Err(error) => {
-                                    log::error!("Azure OpenAI stream JSON parsing error: {} for line: {}", error, line); // Log parsing error with problematic line
                                     Some(Err(anyhow!(error)))
                                 }
                             }
                         }
                     }
                     Err(error) => {
-                        log::error!("Azure OpenAI stream read error: {}", error); // Log read errors
                         Some(Err(anyhow!(error)))
                     }
                 }
@@ -542,7 +535,7 @@ async fn azure_stream_completion(
     } else {
         let mut body = String::new();
         response.body_mut().read_to_string(&mut body).await?;
-        log::error!("Failed to connect to Azure OpenAI API: {} {}", response.status(), body); // Log error body
+        log::error!("Failed to connect to Azure OpenAI API: {} {}", response.status(), body);
         anyhow::bail!("Failed to connect to Azure OpenAI API: {} {}", response.status(), body)
     }
 }
@@ -554,7 +547,6 @@ async fn azure_complete(
     api_key: &str,
     request: open_ai::Request,
 ) -> Result<open_ai::Response> {
-    log::info!("Entering azure_complete for model: {}", request.model);
     use futures::AsyncReadExt;
     use http_client::{AsyncBody, Method, Request as HttpRequest};
 
@@ -562,7 +554,6 @@ async fn azure_complete(
     let azure_request = convert_to_azure_request(request);
 
     let request_body = serde_json::to_string(&azure_request)?;
-    log::info!("Azure OpenAI non-streaming request body: {}", request_body);
 
     let request_builder = HttpRequest::builder()
         .method(Method::POST)
@@ -575,7 +566,6 @@ async fn azure_complete(
 
     let mut body = String::new();
     response.body_mut().read_to_string(&mut body).await?;
-    log::info!("Azure OpenAI non-streaming response body: {}", body);
 
     if response.status().is_success() {
         let azure_response: AzureOpenAiResponse = serde_json::from_str(&body)
