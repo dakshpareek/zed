@@ -482,8 +482,8 @@ async fn azure_stream_completion(
     use futures::{AsyncBufReadExt, AsyncReadExt, io::BufReader, stream, future};
     use http_client::{AsyncBody, Method, Request as HttpRequest};
 
-    // For o1 and o3 models, use non-streaming completion
-    if request.model.starts_with("o1") || request.model.starts_with("o3") {
+    // For o1 models, use non-streaming completion
+    if request.model.starts_with("o1") {
         let response = azure_complete(client, api_url, api_key, request).await;
         let response_stream_event = response.map(adapt_response_to_stream);
         return Ok(stream::once(future::ready(response_stream_event)).boxed());
@@ -492,13 +492,16 @@ async fn azure_stream_completion(
     // Convert OpenAI request to Azure-compatible request
     let azure_request = convert_to_azure_request(request);
 
+    let request_body = serde_json::to_string(&azure_request)?;
+    log::info!("Azure OpenAI request body: {}", request_body);
+
     let request_builder = HttpRequest::builder()
         .method(Method::POST)
         .uri(api_url)
         .header("Content-Type", "application/json")
         .header("api-key", api_key);  // Azure uses "api-key" header instead of "Authorization"
 
-    let request = request_builder.body(AsyncBody::from(serde_json::to_string(&azure_request)?))?;
+    let request = request_builder.body(AsyncBody::from(request_body))?;
     let mut response = client.send(request).await?;
     
     if response.status().is_success() {
@@ -508,26 +511,38 @@ async fn azure_stream_completion(
             .filter_map(|line| async move {
                 match line {
                     Ok(line) => {
+                        log::info!("Azure OpenAI stream raw line: {}", line); // Log the raw line
                         let line = line.strip_prefix("data: ")?;
                         if line == "[DONE]" {
                             None
                         } else {
                             match serde_json::from_str(line) {
-                                Ok(open_ai::ResponseStreamResult::Ok(response)) => Some(Ok(response)),
+                                Ok(open_ai::ResponseStreamResult::Ok(response)) => {
+                                    log::info!("Azure OpenAI stream parsed response: {:?}", response); // Log successful parsing
+                                    Some(Ok(response))
+                                }
                                 Ok(open_ai::ResponseStreamResult::Err { error }) => {
+                                    log::error!("Azure OpenAI stream API error: {}", error); // Log API-returned error
                                     Some(Err(anyhow!(error)))
                                 }
-                                Err(error) => Some(Err(anyhow!(error))),
+                                Err(error) => {
+                                    log::error!("Azure OpenAI stream JSON parsing error: {} for line: {}", error, line); // Log parsing error with problematic line
+                                    Some(Err(anyhow!(error)))
+                                }
                             }
                         }
                     }
-                    Err(error) => Some(Err(anyhow!(error))),
+                    Err(error) => {
+                        log::error!("Azure OpenAI stream read error: {}", error); // Log read errors
+                        Some(Err(anyhow!(error)))
+                    }
                 }
             })
             .boxed())
     } else {
         let mut body = String::new();
         response.body_mut().read_to_string(&mut body).await?;
+        log::error!("Failed to connect to Azure OpenAI API: {} {}", response.status(), body); // Log error body
         anyhow::bail!("Failed to connect to Azure OpenAI API: {} {}", response.status(), body)
     }
 }
@@ -539,12 +554,15 @@ async fn azure_complete(
     api_key: &str,
     request: open_ai::Request,
 ) -> Result<open_ai::Response> {
+    log::info!("Entering azure_complete for model: {}", request.model);
     use futures::AsyncReadExt;
     use http_client::{AsyncBody, Method, Request as HttpRequest};
 
     // Convert OpenAI request to Azure-compatible request (without streaming)
-    let mut azure_request = convert_to_azure_request(request);
-    azure_request.stream = false; // Ensure no streaming for o1/o3 models
+    let azure_request = convert_to_azure_request(request);
+
+    let request_body = serde_json::to_string(&azure_request)?;
+    log::info!("Azure OpenAI non-streaming request body: {}", request_body);
 
     let request_builder = HttpRequest::builder()
         .method(Method::POST)
@@ -552,11 +570,12 @@ async fn azure_complete(
         .header("Content-Type", "application/json")
         .header("api-key", api_key);
 
-    let request = request_builder.body(AsyncBody::from(serde_json::to_string(&azure_request)?))?;
+    let request = request_builder.body(AsyncBody::from(request_body))?;
     let mut response = client.send(request).await?;
 
     let mut body = String::new();
     response.body_mut().read_to_string(&mut body).await?;
+    log::info!("Azure OpenAI non-streaming response body: {}", body);
 
     if response.status().is_success() {
         let azure_response: AzureOpenAiResponse = serde_json::from_str(&body)
