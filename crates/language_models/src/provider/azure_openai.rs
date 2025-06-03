@@ -86,9 +86,16 @@ struct AzureOpenAiRequest {
     tools: Vec<open_ai::ToolDefinition>,
 }
 
-fn convert_to_azure_request(request: open_ai::Request) -> AzureOpenAiRequest {
+fn convert_to_azure_request(request: open_ai::Request, model: &open_ai::Model) -> AzureOpenAiRequest {
     // For o1 and o3 models, use max_completion_tokens instead of max_tokens
     let is_reasoning_model = request.model.starts_with("o1") || request.model.starts_with("o3");
+    
+    // Only set parallel_tool_calls if the model supports it and tools are present
+    let parallel_tool_calls = if model.supports_parallel_tool_calls() && !request.tools.is_empty() {
+        request.parallel_tool_calls
+    } else {
+        None
+    };
     
     AzureOpenAiRequest {
         model: request.model,
@@ -99,7 +106,7 @@ fn convert_to_azure_request(request: open_ai::Request) -> AzureOpenAiRequest {
         stop: request.stop,
         temperature: request.temperature,
         tool_choice: request.tool_choice,
-        parallel_tool_calls: request.parallel_tool_calls,
+        parallel_tool_calls,
         tools: request.tools,
     }
 }
@@ -368,6 +375,7 @@ impl AzureOpenAiLanguageModel {
     {
         let http_client = self.http_client.clone();
         let deployment_name = self.deployment_name.clone();
+        let model = self.model.clone(); // Clone the model to avoid lifetime issues
 
         let Ok((api_key, settings)) = cx.read_entity(&self.state, |state, cx| {
             let settings = &AllLanguageModelSettings::get_global(cx).azure_openai;
@@ -388,7 +396,7 @@ impl AzureOpenAiLanguageModel {
             );
 
             // Use Azure OpenAI specific stream completion
-            azure_stream_completion(http_client.as_ref(), &api_url, &api_key, request).await
+            azure_stream_completion(http_client.as_ref(), &api_url, &api_key, request, &model).await
         }
         .boxed()
     }
@@ -412,7 +420,19 @@ impl LanguageModel for AzureOpenAiLanguageModel {
     }
 
     fn supports_tools(&self) -> bool {
-        true
+        // Check model-specific tool support - o1 models don't support tools
+        if self.model.id().starts_with("o1") {
+            return false;
+        }
+        
+        // Custom models need explicit tool support configuration
+        match &self.model {
+            open_ai::Model::Custom { .. } => {
+                // For custom models, we could check configuration, but for now assume support
+                true
+            }
+            _ => true,
+        }
     }
 
     fn supports_images(&self) -> bool {
@@ -420,6 +440,11 @@ impl LanguageModel for AzureOpenAiLanguageModel {
     }
 
     fn supports_tool_choice(&self, choice: LanguageModelToolChoice) -> bool {
+        // Only support tool choice if the model supports tools
+        if !self.supports_tools() {
+            return false;
+        }
+        
         match choice {
             LanguageModelToolChoice::Auto
             | LanguageModelToolChoice::Any
@@ -476,21 +501,27 @@ async fn azure_stream_completion(
     api_url: &str,
     api_key: &str,
     request: open_ai::Request,
+    model: &open_ai::Model,
 ) -> Result<futures::stream::BoxStream<'static, Result<ResponseStreamEvent>>> {
     use futures::{AsyncBufReadExt, AsyncReadExt, io::BufReader, stream, future};
     use http_client::{AsyncBody, Method, Request as HttpRequest};
 
     // For o1 models, use non-streaming completion
     if request.model.starts_with("o1") {
-        let response = azure_complete(client, api_url, api_key, request).await;
+        log::debug!("Using non-streaming completion for o1 model: {}", request.model);
+        let response = azure_complete(client, api_url, api_key, request, model).await;
         let response_stream_event = response.map(adapt_response_to_stream);
         return Ok(stream::once(future::ready(response_stream_event)).boxed());
     }
 
     // Convert OpenAI request to Azure-compatible request
-    let azure_request = convert_to_azure_request(request);
+    let azure_request = convert_to_azure_request(request, model);
 
-    let request_body = serde_json::to_string(&azure_request)?;
+    let request_body = serde_json::to_string(&azure_request)
+        .context("Failed to serialize Azure OpenAI request")?;
+
+    log::debug!("Azure OpenAI request URL: {}", api_url);
+    log::debug!("Azure OpenAI request body: {}", request_body);
 
     let request_builder = HttpRequest::builder()
         .method(Method::POST)
@@ -499,7 +530,10 @@ async fn azure_stream_completion(
         .header("api-key", api_key);  // Azure uses "api-key" header instead of "Authorization"
 
     let request = request_builder.body(AsyncBody::from(request_body))?;
-    let mut response = client.send(request).await?;
+    let mut response = client.send(request).await
+        .context("Failed to send request to Azure OpenAI API")?;
+    
+    log::debug!("Azure OpenAI response status: {}", response.status());
     
     if response.status().is_success() {
         let reader = BufReader::new(response.into_body());
@@ -508,26 +542,38 @@ async fn azure_stream_completion(
             .filter_map(|line| async move {
                 match line {
                     Ok(line) => {
+                        let line = line.trim();
+                        
+                        // Skip empty lines
+                        if line.is_empty() {
+                            return None;
+                        }
+                        
                         let line = line.strip_prefix("data: ")?;
                         if line == "[DONE]" {
+                            log::debug!("Azure OpenAI stream completed with [DONE]");
                             None
                         } else {
+                            log::debug!("Azure OpenAI stream chunk: {}", line);
                             match serde_json::from_str(line) {
                                 Ok(open_ai::ResponseStreamResult::Ok(response)) => {
                                     Some(Ok(response))
                                 }
                                 Ok(open_ai::ResponseStreamResult::Err { error }) => {
                                     log::error!("Azure OpenAI stream API error: {}", error);
-                                    Some(Err(anyhow!(error)))
+                                    Some(Err(anyhow!("Azure OpenAI API error: {}", error)))
                                 }
                                 Err(error) => {
-                                    Some(Err(anyhow!(error)))
+                                    log::warn!("Failed to parse Azure OpenAI stream chunk: {} - Error: {}", line, error);
+                                    // Don't terminate the stream on parse errors, just log and continue
+                                    None
                                 }
                             }
                         }
                     }
                     Err(error) => {
-                        Some(Err(anyhow!(error)))
+                        log::error!("Error reading line from Azure OpenAI stream: {}", error);
+                        Some(Err(anyhow!("Stream read error: {}", error)))
                     }
                 }
             })
@@ -535,8 +581,36 @@ async fn azure_stream_completion(
     } else {
         let mut body = String::new();
         response.body_mut().read_to_string(&mut body).await?;
-        log::error!("Failed to connect to Azure OpenAI API: {} {}", response.status(), body);
-        anyhow::bail!("Failed to connect to Azure OpenAI API: {} {}", response.status(), body)
+        log::error!("Azure OpenAI API error - Status: {}, Body: {}", response.status(), body);
+        
+        // Try to parse Azure-specific error format
+        #[derive(Deserialize)]
+        struct AzureOpenAiErrorResponse {
+            error: AzureOpenAiError,
+        }
+
+        #[derive(Deserialize)]
+        struct AzureOpenAiError {
+            message: String,
+            #[serde(rename = "type")]
+            error_type: Option<String>,
+            code: Option<String>,
+        }
+
+        match serde_json::from_str::<AzureOpenAiErrorResponse>(&body) {
+            Ok(error_response) => {
+                let error_msg = format!(
+                    "Azure OpenAI API error: {} (type: {}, code: {})",
+                    error_response.error.message,
+                    error_response.error.error_type.unwrap_or_default(),
+                    error_response.error.code.unwrap_or_default()
+                );
+                anyhow::bail!(error_msg);
+            }
+            Err(_) => {
+                anyhow::bail!("Azure OpenAI API error: {} {}", response.status(), body);
+            }
+        }
     }
 }
 
@@ -546,14 +620,20 @@ async fn azure_complete(
     api_url: &str,
     api_key: &str,
     request: open_ai::Request,
+    model: &open_ai::Model,
 ) -> Result<open_ai::Response> {
     use futures::AsyncReadExt;
     use http_client::{AsyncBody, Method, Request as HttpRequest};
 
     // Convert OpenAI request to Azure-compatible request (without streaming)
-    let azure_request = convert_to_azure_request(request);
+    let mut azure_request = convert_to_azure_request(request, model);
+    azure_request.stream = false;
 
-    let request_body = serde_json::to_string(&azure_request)?;
+    let request_body = serde_json::to_string(&azure_request)
+        .context("Failed to serialize Azure OpenAI request")?;
+
+    log::debug!("Azure OpenAI non-streaming request URL: {}", api_url);
+    log::debug!("Azure OpenAI non-streaming request body: {}", request_body);
 
     let request_builder = HttpRequest::builder()
         .method(Method::POST)
@@ -562,14 +642,18 @@ async fn azure_complete(
         .header("api-key", api_key);
 
     let request = request_builder.body(AsyncBody::from(request_body))?;
-    let mut response = client.send(request).await?;
+    let mut response = client.send(request).await
+        .context("Failed to send request to Azure OpenAI API")?;
 
     let mut body = String::new();
     response.body_mut().read_to_string(&mut body).await?;
 
+    log::debug!("Azure OpenAI non-streaming response status: {}", response.status());
+    log::debug!("Azure OpenAI non-streaming response body: {}", body);
+
     if response.status().is_success() {
         let azure_response: AzureOpenAiResponse = serde_json::from_str(&body)
-            .context("failed to parse Azure OpenAI response")?;
+            .context("Failed to parse Azure OpenAI response")?;
         
         if azure_response.choices.is_empty() {
             anyhow::bail!("Azure OpenAI response contained no choices. Response body: {}", body);
@@ -577,7 +661,34 @@ async fn azure_complete(
         
         Ok(convert_azure_response_to_openai(azure_response))
     } else {
-        anyhow::bail!("Failed to connect to Azure OpenAI API: {} {}", response.status(), body)
+        // Try to parse Azure-specific error format
+        #[derive(Deserialize)]
+        struct AzureOpenAiErrorResponse {
+            error: AzureOpenAiError,
+        }
+
+        #[derive(Deserialize)]
+        struct AzureOpenAiError {
+            message: String,
+            #[serde(rename = "type")]
+            error_type: Option<String>,
+            code: Option<String>,
+        }
+
+        match serde_json::from_str::<AzureOpenAiErrorResponse>(&body) {
+            Ok(error_response) => {
+                let error_msg = format!(
+                    "Azure OpenAI API error: {} (type: {}, code: {})",
+                    error_response.error.message,
+                    error_response.error.error_type.unwrap_or_default(),
+                    error_response.error.code.unwrap_or_default()
+                );
+                anyhow::bail!(error_msg);
+            }
+            Err(_) => {
+                anyhow::bail!("Azure OpenAI API error: {} {}", response.status(), body);
+            }
+        }
     }
 }
 
