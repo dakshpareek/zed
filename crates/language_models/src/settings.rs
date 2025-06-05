@@ -445,6 +445,7 @@ impl settings::Settings for AllLanguageModelSettings {
             merge(
                 &mut settings.azure_openai.available_models,
                 azure_openai.as_ref().and_then(|s| s.available_models.clone()),
+            );
             // OpenRouter
             let open_router = value.open_router.clone();
             merge(
