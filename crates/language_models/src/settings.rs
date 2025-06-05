@@ -458,7 +458,7 @@ impl settings::Settings for AllLanguageModelSettings {
                     .as_ref()
                     .and_then(|s| s.available_models.clone()),
             );
-        }
+        } // This closes the for loop
 
         Ok(settings)
     }
