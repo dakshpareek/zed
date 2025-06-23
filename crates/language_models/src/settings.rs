@@ -14,7 +14,6 @@ use crate::provider::{
     azure_openai::AzureOpenAiSettings,
     bedrock::AmazonBedrockSettings,
     cloud::{self, ZedDotDevSettings},
-    copilot_chat::CopilotChatSettings,
     deepseek::DeepSeekSettings,
     google::GoogleSettings,
     lmstudio::LmStudioSettings,
@@ -67,7 +66,7 @@ pub struct AllLanguageModelSettings {
     pub open_router: OpenRouterSettings,
     pub zed_dot_dev: ZedDotDevSettings,
     pub google: GoogleSettings,
-    pub copilot_chat: CopilotChatSettings,
+
     pub lmstudio: LmStudioSettings,
     pub deepseek: DeepSeekSettings,
     pub mistral: MistralSettings,
@@ -86,7 +85,7 @@ pub struct AllLanguageModelSettingsContent {
     pub zed_dot_dev: Option<ZedDotDevSettingsContent>,
     pub google: Option<GoogleSettingsContent>,
     pub deepseek: Option<DeepseekSettingsContent>,
-    pub copilot_chat: Option<CopilotChatSettingsContent>,
+
     pub mistral: Option<MistralSettingsContent>,
 }
 
@@ -280,9 +279,6 @@ pub struct GoogleSettingsContent {
 pub struct ZedDotDevSettingsContent {
     available_models: Option<Vec<cloud::AvailableModel>>,
 }
-
-#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, JsonSchema)]
-pub struct CopilotChatSettingsContent {}
 
 #[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct OpenRouterSettingsContent {
