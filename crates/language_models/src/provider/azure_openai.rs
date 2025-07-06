@@ -455,7 +455,12 @@ impl LanguageModel for AzureOpenAiLanguageModel {
             LanguageModelCompletionError,
         >,
     > {
-        let request = into_open_ai(request, &self.model, self.model.max_output_tokens());
+        let request = into_open_ai(
+            request, 
+            &self.model.id(), 
+            self.model.supports_parallel_tool_calls(), 
+            self.model.max_output_tokens()
+        );
         let completions = self.stream_completion(request, cx);
         async move {
             let mapper = OpenAiEventMapper::new();
